@@ -255,11 +255,15 @@ def login_form(
                         disabled=st.session_state["authenticated"],
                         use_container_width=True,
                     ):
-                        if constrain_password and not validate_password(password):
-                            st.error(password_constraint_check_fail_message)
-                            st.stop()
-
                         try:
+                            if constrain_password and not validate_password(password):
+                                st.error(password_constraint_check_fail_message)
+                                st.stop()
+
+                            if not username or not password:
+                                st.error("Please provide both username and password")
+                                st.stop()
+
                             if isinstance(client, SQLConnection):
                                 fqn = get_fully_qualified_name(
                                     client,
@@ -277,8 +281,6 @@ def login_form(
                                     role_col_quoted = quoted_name(role_col, True)
                                     cols += f", {role_col_quoted}"
                                     values += ", :role"
-                                    # Normalize role_default to lowercase when creating user
-                                    params["role"] = role_default.lower()
 
                                 query = text(
                                     f"INSERT INTO {fqn} ({cols}) " f"VALUES ({values})"
@@ -309,15 +311,29 @@ def login_form(
                                 client.table(user_tablename).insert(
                                     insert_data
                                 ).execute()
-                        except Exception as e:
-                            error_message = getattr(
-                                e, "message", str(e)
-                            )  # Fallback to str(e) if no message attribute
-                            st.error(error_message)
-                            st.session_state["authenticated"] = False
-                        else:
+
                             login_success(username)
                             st.rerun()
+
+                        except Exception as e:
+                            # Log the actual error for debugging (not visible to users)
+                            print(f"User creation error: {str(e)}")
+
+                            # Show user-friendly error message
+                            if (
+                                "unique" in str(e).lower()
+                                or "duplicate" in str(e).lower()
+                            ):
+                                st.error(
+                                    "This username is already taken. Please choose another one."
+                                )
+                            else:
+                                st.error(
+                                    "There was an error creating your account. Please try again later."
+                                )
+
+                            st.session_state["authenticated"] = False
+                            st.stop()
 
         # Login to existing account
         with login_tab:
@@ -343,73 +359,111 @@ def login_form(
                     type="primary",
                     use_container_width=True,
                 ):
-                    if isinstance(client, SQLConnection):
-                        fqn = get_fully_qualified_name(
-                            client, user_databasename, user_schemaname, user_tablename
-                        )
-                        username_col_quoted = quoted_name(username_col, True)
-                        password_col_quoted = quoted_name(password_col, True)
+                    try:
+                        if not username or not password:
+                            st.error("Please provide both username and password")
+                            st.stop()
 
-                        # Add role to SELECT if needed
-                        select_cols = f"{username_col_quoted}, {password_col_quoted}"
-                        if retrieve_role:
-                            role_col_quoted = quoted_name(role_col, True)
-                            select_cols += f", {role_col_quoted}"
+                        if isinstance(client, SQLConnection):
+                            try:
+                                fqn = get_fully_qualified_name(
+                                    client,
+                                    user_databasename,
+                                    user_schemaname,
+                                    user_tablename,
+                                )
+                                username_col_quoted = quoted_name(username_col, True)
+                                password_col_quoted = quoted_name(password_col, True)
 
-                        query = text(
-                            f"SELECT {select_cols} "
-                            f"FROM {fqn} WHERE {username_col_quoted} = :username"
-                        )
-                        with client.session as session:
-                            result = session.execute(query, {"username": username})
-                            # Include role in dictionary if it was retrieved
-                            data = [
-                                {
-                                    username_col: row[0],
-                                    password_col: row[1],
-                                    **({"role": row[2]} if retrieve_role else {}),
-                                }
-                                for row in result
-                            ]
-                    else:
-                        # Supabase client
-                        select_cols = f"{username_col}, {password_col}"
-                        if retrieve_role:
-                            select_cols += f", {role_col}"
+                                select_cols = (
+                                    f"{username_col_quoted}, {password_col_quoted}"
+                                )
+                                if retrieve_role:
+                                    role_col_quoted = quoted_name(role_col, True)
+                                    select_cols += f", {role_col_quoted}"
 
-                        response = (
-                            client.table(user_tablename)
-                            .select(select_cols)
-                            .eq(username_col, username)
-                            .execute()
-                        )
-                        data = response.data
-
-                    if len(data) > 0:
-                        db_password = data[0][password_col]
-
-                        if not db_password.startswith("$argon2id$"):
-                            db_password = rehash_pwd_in_db(db_password, username)
-
-                        if auth.verify_password(db_password, password):
-                            # Normalize role to lowercase if it exists
-                            role = (
-                                data[0].get("role", "").lower()
-                                if retrieve_role
-                                else None
-                            )
-                            login_success(username, role)
-
-                            if auth.check_needs_rehash(db_password):
-                                _ = rehash_pwd_in_db(password, username)
-                            st.rerun()
+                                query = text(
+                                    f"SELECT {select_cols} "
+                                    f"FROM {fqn} WHERE {username_col_quoted} = :username"
+                                )
+                                with client.session as session:
+                                    result = session.execute(
+                                        query, {"username": username}
+                                    )
+                                    data = [
+                                        {
+                                            username_col: row[0],
+                                            password_col: row[1],
+                                            **(
+                                                {"role": row[2]}
+                                                if retrieve_role
+                                                else {}
+                                            ),
+                                        }
+                                        for row in result
+                                    ]
+                            except Exception as e:
+                                print(f"Database query error: {str(e)}")
+                                raise
                         else:
+                            try:
+                                select_cols = f"{username_col}, {password_col}"
+                                if retrieve_role:
+                                    select_cols += f", {role_col}"
+
+                                response = (
+                                    client.table(user_tablename)
+                                    .select(select_cols)
+                                    .eq(username_col, username)
+                                    .execute()
+                                )
+                                data = response.data
+                            except Exception as e:
+                                print(f"Supabase query error: {str(e)}")
+                                raise
+
+                        if len(data) > 0:
+                            try:
+                                db_password = data[0][password_col]
+
+                                if not db_password.startswith("$argon2id$"):
+                                    db_password = rehash_pwd_in_db(
+                                        db_password, username
+                                    )
+
+                                if auth.verify_password(db_password, password):
+                                    role = (
+                                        data[0].get("role", "").lower()
+                                        if retrieve_role
+                                        else None
+                                    )
+                                    login_success(username, role)
+
+                                    if auth.check_needs_rehash(db_password):
+                                        _ = rehash_pwd_in_db(password, username)
+                                    st.rerun()
+                                else:
+                                    st.error(login_error_message)
+                                    st.session_state["authenticated"] = False
+                            except Exception as e:
+                                print(f"Password verification error: {str(e)}")
+                                st.error(login_error_message)
+                                st.session_state["authenticated"] = False
+                        else:
+                            # Use the same error message for non-existent users
+                            # to prevent username enumeration
                             st.error(login_error_message)
                             st.session_state["authenticated"] = False
 
-                    else:
-                        st.error(login_error_message)
+                    except Exception as e:
+                        # Log the actual error for debugging (not visible to users)
+                        print(f"Login error: {str(e)}")
+                        # Show generic error message to user
+                        st.error(
+                            "An error occurred during login. Please try again later."
+                        )
                         st.session_state["authenticated"] = False
+                        st.stop()
 
         # Guest login
         if allow_guest:
